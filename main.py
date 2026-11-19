@@ -8,27 +8,45 @@ extrapolated with an exponentially decaying trend (launch-week trends
 decelerate, so a trend measured over the history is not projected linearly
 over the whole horizon); (2) a count view of the same move -- earners and
 players-tracked grow at different rates, and the rate is their ratio -- whose
-logit is blended with the drift view; and (3) a per-trophy logit volatility,
-shrunk toward the cross-trophy median, which together with a
-trend-uncertainty term sets the spread. Slope estimates are shrunk by an
-empirical-Bayes weight (a trophy's slope counts only as far as it rises
-above its own estimation noise, which grows with volatility), so calm
-histories keep their drift and wild ones fall back toward the global drift
-with a wider spread. The series used for slopes and volatility is
-count-smoothed with each read's players_tracked ((earned + 0.5) /
-(players + 1)) so the 0.01/99.99 clamp's logit of 9.2 does not fake a huge
-slope when a rate leaves 100%; the median itself starts from the raw last
-rate, with one guard: a rate at the very edge (>= 99.9% or <= 0.1%) has an
-almost unidentified logit, so the tail pointing back toward the middle is
-widened (with a floor on that side's spread) while the median stays at the
-drift forecast -- cheap insurance if the rate stays pinned, real cover if
-new tracked players dilute it. (A draft that also pulled the median to
-99.5% was dropped: the synthetic stress test showed it costs more than it
-saves when the rate stays pinned, because the upper quantiles, whose
-pinball weights are the expensive ones, are dragged down with it.)
-Quantiles are also mildly asymmetric in the direction of the estimated
-drift: when a trophy is trending up, its upper tail is wider than its
-lower tail.
+growth rates are endpoint-corrected like the drift (a window's average
+growth overstates the growth at its end when growth itself is decaying, the
+usual launch-week shape: the player pool's growth front-loads, so the raw
+average understates how fast dilution is fading) and whose implied median
+shift is capped before it is blended with the drift view, so a launch-week
+catch-up burst in the counts cannot extrapolate into an explosion; and (3)
+a per-trophy logit volatility, measured on slope-detrended steps so a
+steady trend is not mistaken for noise, shrunk toward the cross-trophy
+median, which together with a trend-uncertainty term sets the spread. A
+positive blended shift is also damped as the forecast rate approaches a
+tier-plausible ceiling share (platinum trophies saturate far below bronze
+ones): earn rates bend toward their ceiling instead of running through it.
+Slope estimates are shrunk by an empirical-Bayes weight (a trophy's slope
+counts only as far as it rises above its own estimation noise, which grows
+with volatility), so calm histories keep their drift and wild ones fall
+back toward the global drift with a wider spread. The series used for
+slopes and volatility is count-smoothed with each read's players_tracked
+((earned + 0.5) / (players + 1)) so the 0.01/99.99 clamp's logit of 9.2
+does not fake a huge slope when a rate leaves 100%; the median itself
+starts from the raw last rate, with one guard: a rate at the very edge
+(>= 99.9% or <= 0.1%) has an almost unidentified logit, so the tail
+pointing back toward the middle is widened (with a floor on that side's
+spread) while the median stays at the drift forecast -- cheap insurance if
+the rate stays pinned, real cover if new tracked players dilute it. (A
+draft that also pulled the median to 99.5% was dropped: the synthetic
+stress test showed it costs more than it saves when the rate stays pinned,
+because the upper quantiles, whose pinball weights are the expensive ones,
+are dragged down with it.) Quantiles are also mildly asymmetric in the
+direction of the estimated drift: when a trophy is trending up, its upper
+tail is wider than its lower tail.
+
+Two further mechanisms were built and rejected on the stress library
+before this version shipped: a structural cohort view (fitting
+dE = m*dP + pi*(P - E)*dt per trophy to separate new-player dilution from
+existing-player progression) helped the counts-based launch scenarios a
+little but cost more on logit-trend scenarios than it earned, and an
+adaptive trend-decay time estimated from recent-vs-full slope ratios
+proved too noisy to trust. The shipped model is the combination that won
+the full scenario library head-to-head against the previous version.
 
 Everything is deterministic, O(reads x trophies), standard library only, and
 keeps the starter's I/O contract exactly: read every *.in in
@@ -56,11 +74,13 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 # --- model constants (chosen by reasoning about the final horizon, and ---
 # --- stress-tested on synthetic launch-week histories; see repo README) ---
 DRIFT_TAU_DAYS = 2.5      # trend decay time for the logit-drift view
-COUNT_TAU_DAYS = 2.0      # growth decay time for the earners/players view
+COUNT_TAU_DAYS = 2.0      # growth decay time for the count view
 RECENT_WINDOW_DAYS = 1.5  # window for the "recent" slope; full span also used
 DRIFT_SHRINK = 0.55       # weight on a trophy's own slope vs the global median
 COUNT_SHRINK = 0.5        # weight on a trophy's own earner growth vs global
 BLEND_DRIFT = 0.65        # median blend: drift view vs count view
+VIEW_SHIFT_DOWN = -1.1    # cap on the count view's implied median shift
+VIEW_SHIFT_UP = 1.3
 SHIFT_CAP_DOWN = -1.4     # caps on the total median shift, in logit units
 SHIFT_CAP_UP = 2.2
 SLOPE_CAP_DOWN = -1.2     # caps on a shrunk daily logit slope
@@ -69,6 +89,10 @@ SIGMA_CAP = 1.7
 VOL_FLOOR = 0.08
 TREND_UNC = 0.40          # spread grows with |shift|: trend may not persist
 BASE_UNC = 0.08
+# Tier-plausible ceiling shares (fraction of tracked players) for the
+# saturation damping of positive shifts; secret trophies sit lower.
+TIER_CAP = {"platinum": 0.12, "gold": 0.35, "silver": 0.65, "bronze": 0.97}
+SECRET_CAP_MULT = 0.8
 
 
 def clamp_rate(x: float) -> float:
@@ -179,6 +203,7 @@ def forecast_case(case: dict, name: str) -> dict:
         times = [0.5 * i / 24.0 for i in range(len(history))]
     span = times[-1] - times[0] if len(times) > 1 else 0.0
     recent_from = times[-1] - min(span, RECENT_WINDOW_DAYS)
+    recent_width = min(span, RECENT_WINDOW_DAYS)
 
     # --- per-trophy series -------------------------------------------------
     # For each trophy: times, smoothed logits, log earner counts, last values.
@@ -220,6 +245,17 @@ def forecast_case(case: dict, name: str) -> dict:
             return ols_slope(wt, wy)
         return ols_slope(ts, ys)
 
+    def endpoint(slope_w, width, tau):
+        # A window's OLS slope averages a decaying trend over the window, so
+        # it overstates the trend at the window's end (the point the forecast
+        # extrapolates from) by (tau/W) * (exp(W/tau) - 1) for window W.
+        # Divide that factor back out so the result estimates the
+        # instantaneous slope at the last read.
+        if width <= 1e-9:
+            return slope_w
+        factor = (tau / width) * (math.exp(width / tau) - 1.0)
+        return slope_w / factor
+
     for p in per:
         if len(p["ts"]) >= 2 and span > 1e-9:
             p["slope_recent"] = window_slope(p["ts"], p["lgs"], recent_from)
@@ -227,31 +263,23 @@ def forecast_case(case: dict, name: str) -> dict:
         else:
             p["slope_recent"] = 0.0
             p["slope_full"] = 0.0
-        # A window's OLS slope averages a decaying trend over the window, so
-        # it overstates the trend at the window's end (the point the forecast
-        # extrapolates from) by (tau/W) * (exp(W/tau) - 1) for window W.
-        # Divide that factor back out, window by window, so "slope" below is
-        # an estimate of the instantaneous slope at the last read.
-        def endpoint(slope_w, width):
-            if width <= 1e-9:
-                return slope_w
-            factor = (DRIFT_TAU_DAYS / width) * (math.exp(width / DRIFT_TAU_DAYS) - 1.0)
-            return slope_w / factor
-        recent_width = min(span, RECENT_WINDOW_DAYS)
-        p["slope"] = 0.6 * endpoint(p["slope_recent"], recent_width) \
-            + 0.4 * endpoint(p["slope_full"], span)
-        # earner-count growth on the recent window (None where no counts)
+        p["slope"] = 0.6 * endpoint(p["slope_recent"], recent_width, DRIFT_TAU_DAYS) \
+            + 0.4 * endpoint(p["slope_full"], span, DRIFT_TAU_DAYS)
+        # earner-count growth on the recent window (None where no counts),
+        # endpoint-corrected on the count view's own decay time
         pairs = [(t, e) for t, e in zip(p["ts"], p["les"]) if e is not None]
         if len(pairs) >= 2 and span > 1e-9:
             wt = [t for t, _ in pairs if t >= recent_from]
             we = [e for t, e in pairs if t >= recent_from]
             if len(wt) >= 2 and wt[-1] - wt[0] > 1e-9:
-                p["g_earn"] = ols_slope(wt, we)
+                p["g_earn"] = endpoint(ols_slope(wt, we),
+                                       recent_width, COUNT_TAU_DAYS)
             else:
                 p["g_earn"] = ols_slope([t for t, _ in pairs], [e for _, e in pairs])
         else:
             p["g_earn"] = None
-        # random-walk volatility per day from consecutive logit steps
+        # random-walk volatility per day from consecutive logit steps,
+        # detrended by the full-span slope so trend is not read as noise
         if len(p["ts"]) >= 2:
             num = 0.0
             den = 0.0
@@ -259,7 +287,8 @@ def forecast_case(case: dict, name: str) -> dict:
                                           zip(p["ts"][1:], p["lgs"][1:])):
                 dt = t2 - t1
                 if dt > 1e-9:
-                    num += (y2 - y1) ** 2
+                    step = (y2 - y1) - p["slope_full"] * dt
+                    num += step ** 2
                     den += dt
             p["vol"] = math.sqrt(num / den) if den > 0 else 0.0
         else:
@@ -300,7 +329,8 @@ def forecast_case(case: dict, name: str) -> dict:
         wt = [t for t, _ in pts if t >= recent_from]
         wp = [v for t, v in pts if t >= recent_from]
         if len(wt) >= 2 and wt[-1] - wt[0] > 1e-9:
-            g_players = ols_slope(wt, wp)
+            g_players = endpoint(ols_slope(wt, wp),
+                                 recent_width, COUNT_TAU_DAYS)
         else:
             g_players = ols_slope([t for t, _ in pts], [v for _, v in pts])
     else:
@@ -329,7 +359,9 @@ def forecast_case(case: dict, name: str) -> dict:
         logit_drift = base_logit + shift
 
         # Count view: grow earners and players separately, take the ratio.
-        # Its weight fades when the trophy's own growth estimate is noisy.
+        # Its implied shift from the last rate is capped before blending,
+        # so a launch-week catch-up burst in the counts cannot dominate
+        # the median (and a dilution plunge cannot either).
         logit_med = logit_drift
         if p["g_earn"] is not None and p["last_players"] \
                 and p["last_rate"] is not None:
@@ -341,8 +373,23 @@ def forecast_case(case: dict, name: str) -> dict:
             players_f = p["last_players"] * math.exp(g_players * h_count)
             if players_f > 0:
                 rate_b = clamp_rate(100.0 * earned_f / players_f)
+                shift_b = cap(logit(rate_b) - base_logit,
+                              VIEW_SHIFT_DOWN, VIEW_SHIFT_UP)
                 logit_med = BLEND_DRIFT * logit_drift \
-                    + (1.0 - BLEND_DRIFT) * logit(rate_b)
+                    + (1.0 - BLEND_DRIFT) * (base_logit + shift_b)
+
+        # Saturation damping: bend a positive total shift as the forecast
+        # rate approaches the tier's plausible ceiling share.
+        total_shift = logit_med - base_logit
+        if total_shift > 0:
+            tier_cap = TIER_CAP.get(trophy.get("tier"), 0.9)
+            if trophy.get("secret"):
+                tier_cap *= SECRET_CAP_MULT
+            r_pre = inv_logit(logit_med) / 100.0
+            if r_pre > 0.55 * tier_cap:
+                damp = cap(1.15 - (r_pre / tier_cap) ** 2, 0.15, 1.0)
+                total_shift *= damp
+                logit_med = base_logit + total_shift
 
         # Extreme-rate guard: at >= 99.9% (or <= 0.1%) the clamped logit is
         # nearly unidentified; mark it so the tails below can widen inward.
@@ -363,14 +410,14 @@ def forecast_case(case: dict, name: str) -> dict:
         base_unc = BASE_UNC * math.sqrt(min(horizon_days, 1.0))
         sigma_floor = 0.02 + 0.10 * math.sqrt(min(horizon_days, 1.0))
         sigma = math.sqrt((vol_shrunk * math.sqrt(horizon_days)) ** 2
-                          + (TREND_UNC * abs(shift)) ** 2
+                          + (TREND_UNC * abs(total_shift)) ** 2
                           + base_unc ** 2)
         sigma = cap(sigma, sigma_floor, SIGMA_CAP)
 
         # Mild asymmetry in the direction of the trend.
-        if shift > 0.25:
+        if total_shift > 0.25:
             up_mult, down_mult = 1.10, 0.93
-        elif shift < -0.25:
+        elif total_shift < -0.25:
             up_mult, down_mult = 0.93, 1.10
         else:
             up_mult = down_mult = 1.0
