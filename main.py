@@ -18,9 +18,24 @@ a per-trophy logit volatility, measured on slope-detrended steps so a
 steady trend is not mistaken for noise, shrunk toward the cross-trophy
 median, which together with a trend-uncertainty term sets the spread. A
 positive blended shift is also damped as the forecast rate approaches a
-tier-plausible ceiling share (platinum trophies saturate far below bronze
-ones): earn rates bend toward their ceiling instead of running through it.
-Slope estimates are shrunk by an empirical-Bayes weight (a trophy's slope
+ceiling share of tracked players: earn rates bend toward their ceiling
+instead of running through it. The ceiling is a tier prior (platinum
+trophies saturate far below bronze ones), tightened per trophy by a
+ceiling fitted to its own history -- a profile fit of the saturating
+counts dynamics dE = m*dP + pi*(s*P - E)*dt over a grid of candidate
+ceilings, trusted only when it beats the tier prior's fit by a clear
+margin. Because the player path sits inside that regression, a fading
+player-growth surge (pure denominator dynamics) does not masquerade as a
+ceiling; only a genuine bend in the earners' own approach identifies one.
+The fitted ceiling also caps the shift itself, and as the median nears
+the ceiling the up tail is compressed (the down tail is not: dilution
+room remains). The spread is capped at 1.15 logit units, close to the
+house baseline's own spread at the final horizon (0.5 * sqrt(4.52) ~
+1.06): volatility measured on bending launch-week series systematically
+overstates the noise in the smooth counts dynamics that actually move
+earn rates, and the cap binds exactly there, while genuinely noisy
+histories rarely reach it. Slope estimates are shrunk by an
+empirical-Bayes weight (a trophy's slope
 counts only as far as it rises above its own estimation noise, which grows
 with volatility), so calm histories keep their drift and wild ones fall
 back toward the global drift with a wider spread. The series used for
@@ -39,14 +54,20 @@ are dragged down with it.) Quantiles are also mildly asymmetric in the
 direction of the estimated drift: when a trophy is trending up, its upper
 tail is wider than its lower tail.
 
-Two further mechanisms were built and rejected on the stress library
-before this version shipped: a structural cohort view (fitting
+Further mechanisms were built and rejected on the stress library before
+this version shipped: a structural cohort view (fitting
 dE = m*dP + pi*(P - E)*dt per trophy to separate new-player dilution from
 existing-player progression) helped the counts-based launch scenarios a
-little but cost more on logit-trend scenarios than it earned, and an
+little but cost more on logit-trend scenarios than it earned; an
 adaptive trend-decay time estimated from recent-vs-full slope ratios
-proved too noisy to trust. The shipped model is the combination that won
-the full scenario library head-to-head against the previous version.
+proved too noisy to trust; a two-segment detrended volatility read the
+genuine noise of wild histories as trend; and per-level spread
+multipliers fitted on one scenario family (logit-path histories want
+wider tails, counts-based launch histories narrower) failed
+cross-validation on the other family every time, so no global
+calibration constants are carried. The shipped model is the combination
+that won the full scenario library head-to-head against the previous
+version.
 
 Everything is deterministic, O(reads x trophies), standard library only, and
 keeps the starter's I/O contract exactly: read every *.in in
@@ -85,7 +106,7 @@ SHIFT_CAP_DOWN = -1.4     # caps on the total median shift, in logit units
 SHIFT_CAP_UP = 2.2
 SLOPE_CAP_DOWN = -1.2     # caps on a shrunk daily logit slope
 SLOPE_CAP_UP = 1.8
-SIGMA_CAP = 1.7
+SIGMA_CAP = 1.15
 VOL_FLOOR = 0.08
 TREND_UNC = 0.40          # spread grows with |shift|: trend may not persist
 BASE_UNC = 0.08
@@ -93,6 +114,10 @@ BASE_UNC = 0.08
 # saturation damping of positive shifts; secret trophies sit lower.
 TIER_CAP = {"platinum": 0.12, "gold": 0.35, "silver": 0.65, "bronze": 0.97}
 SECRET_CAP_MULT = 0.8
+CEIL_MIN_IMPROVE = 0.13   # min SSE improvement vs tier prior to trust s*
+CEIL_MIN_IVS = 7          # min count intervals for the ceiling fit
+CEIL_W_MULT = 2.2         # ceiling weight per unit of fit improvement
+CEIL_W_CAP = 0.75         # max weight on a fitted ceiling vs the tier prior
 
 
 def clamp_rate(x: float) -> float:
@@ -209,7 +234,7 @@ def forecast_case(case: dict, name: str) -> dict:
     # For each trophy: times, smoothed logits, log earner counts, last values.
     per = []
     for i in range(len(trophies)):
-        ts, lgs, les = [], [], []
+        ts, lgs, les, cts = [], [], [], []
         last_rate, last_players, last_logit = None, None, None
         last_raw_logit = None
         for read, t in zip(history, times):
@@ -222,12 +247,13 @@ def forecast_case(case: dict, name: str) -> dict:
             lgs.append(lg)
             if players and players > 0:
                 les.append(math.log(rate / 100.0 * players + 0.5))
+                cts.append((t, rate / 100.0 * players, float(players)))
             else:
                 les.append(None)
             last_rate, last_players, last_logit = rate, players, lg
             last_raw_logit = logit(rate)
         per.append({
-            "ts": ts, "lgs": lgs, "les": les,
+            "ts": ts, "lgs": lgs, "les": les, "cts": cts,
             "last_rate": last_rate, "last_players": last_players,
             "last_logit": last_logit, "last_raw_logit": last_raw_logit,
         })
@@ -293,6 +319,8 @@ def forecast_case(case: dict, name: str) -> dict:
             p["vol"] = math.sqrt(num / den) if den > 0 else 0.0
         else:
             p["vol"] = None
+        p["s_hat"] = None
+        p["s_w"] = 0.0
         # Estimation noise of the slope: Var(slope) ~= vol^2 / Sxx over the
         # recent window (the window the combined slope leans on most).
         wt = [t for t in p["ts"] if t >= recent_from]
@@ -320,6 +348,67 @@ def forecast_case(case: dict, name: str) -> dict:
     global_g_earn = median(g_earn_known) if g_earn_known else 0.0
     vols_known = [p["vol"] for p in per if p["vol"] is not None]
     global_vol = median(vols_known) if vols_known else 0.5
+
+    # --- per-trophy ceiling estimates (profile fit) ------------------------
+    # Fit dE = m*dP + pi*(s*P - E)*dt over a grid of candidate ceilings s
+    # and keep the best-fitting s*, weighted by how much it improves on
+    # the tier prior's fit. Because the player path P(t) is inside the
+    # regression, denominator dynamics (a growth surge fading) do not
+    # masquerade as a ceiling; only a genuine bend in the earners' own
+    # approach identifies a ceiling below the tier prior.
+    for trophy, p in zip(trophies, per):
+        cts = p["cts"]
+        if len(cts) < 8 or span < 1.0 or p["last_rate"] is None:
+            continue
+        tier_c = TIER_CAP.get(trophy.get("tier"), 0.9)
+        if trophy.get("secret"):
+            tier_c *= SECRET_CAP_MULT
+        r_last = p["last_rate"] / 100.0
+        ivs = []
+        for (t1, e1, pl1), (t2, e2, pl2) in zip(cts, cts[1:]):
+            dt = t2 - t1
+            if dt > 1e-9:
+                ivs.append((pl2 - pl1, pl1, e1, dt, e2 - e1))
+        if len(ivs) < CEIL_MIN_IVS:
+            continue
+
+        def sse_for(s_c):
+            s11 = s12 = s22 = b1 = b2 = 0.0
+            for dp, pl1, e1, dt, de in ivs:
+                x1 = dp
+                x2 = (s_c * pl1 - e1) * dt
+                s11 += x1 * x1
+                s12 += x1 * x2
+                s22 += x2 * x2
+                b1 += x1 * de
+                b2 += x2 * de
+            det = s11 * s22 - s12 * s12
+            if det <= 1e-9 or s22 <= 0:
+                return None
+            m_ = (b1 * s22 - b2 * s12) / det
+            pi_ = (b2 * s11 - b1 * s12) / det
+            sse = 0.0
+            for dp, pl1, e1, dt, de in ivs:
+                pred = m_ * dp + pi_ * (s_c * pl1 - e1) * dt
+                sse += (de - pred) ** 2
+            return sse
+
+        lo_s = max(r_last * 1.02, 0.005)
+        if lo_s >= tier_c:
+            continue
+        grid = [lo_s * (tier_c / lo_s) ** (k / 14.0) for k in range(15)]
+        scored = [(sse_for(s_c), s_c) for s_c in grid]
+        scored = [(v, s_c) for v, s_c in scored if v is not None]
+        if not scored:
+            continue
+        sse_best, s_best = min(scored)
+        sse_cap = sse_for(tier_c)
+        if sse_cap is None or sse_cap <= 0:
+            continue
+        improve = (sse_cap - sse_best) / sse_cap
+        if improve > CEIL_MIN_IMPROVE and s_best < tier_c:
+            p["s_hat"] = s_best
+            p["s_w"] = cap(improve * CEIL_W_MULT, 0.12, CEIL_W_CAP)
 
     # --- players-tracked growth (recent window), shared by all trophies ----
     pts = [(t, math.log(read["players_tracked"]))
@@ -379,15 +468,32 @@ def forecast_case(case: dict, name: str) -> dict:
                     + (1.0 - BLEND_DRIFT) * (base_logit + shift_b)
 
         # Saturation damping: bend a positive total shift as the forecast
-        # rate approaches the tier's plausible ceiling share.
+        # rate approaches the trophy's ceiling share -- the tier prior,
+        # tightened by the trophy's own estimated ceiling when its
+        # history bends visibly toward one. Negative shifts are never
+        # damped: dilution can pull a near-ceiling rate back down.
         total_shift = logit_med - base_logit
+        tier_cap = TIER_CAP.get(trophy.get("tier"), 0.9)
+        if trophy.get("secret"):
+            tier_cap *= SECRET_CAP_MULT
+        s_use = tier_cap
+        if p.get("s_hat") is not None and p["last_rate"] is not None:
+            w = p["s_w"]
+            s_blend = math.exp(w * math.log(p["s_hat"])
+                               + (1.0 - w) * math.log(tier_cap))
+            s_use = max(min(tier_cap, s_blend),
+                        p["last_rate"] / 100.0 + 0.01)
         if total_shift > 0:
-            tier_cap = TIER_CAP.get(trophy.get("tier"), 0.9)
-            if trophy.get("secret"):
-                tier_cap *= SECRET_CAP_MULT
+            # The shift may not carry the median (far) past the ceiling:
+            # cap it at the ceiling's logit, less a small margin, when
+            # that binds harder than the global cap.
+            ceil_shift = logit(100.0 * s_use) - base_logit - 0.10
+            if ceil_shift < total_shift:
+                total_shift = max(ceil_shift, 0.0)
+                logit_med = base_logit + total_shift
             r_pre = inv_logit(logit_med) / 100.0
-            if r_pre > 0.55 * tier_cap:
-                damp = cap(1.15 - (r_pre / tier_cap) ** 2, 0.15, 1.0)
+            if r_pre > 0.55 * s_use:
+                damp = cap(1.15 - (r_pre / s_use) ** 2, 0.15, 1.0)
                 total_shift *= damp
                 logit_med = base_logit + total_shift
 
@@ -433,6 +539,14 @@ def forecast_case(case: dict, name: str) -> dict:
             sigma_up = max(sigma_up * 1.5, 0.55)
             sigma_down *= 0.85
 
+        # Headroom compression: with the median close to the ceiling,
+        # the rate has little room left to rise, so the up tail narrows
+        # (the down tail is untouched -- dilution room remains).
+        if horizon_days > 0.25:
+            r_med = inv_logit(logit_med) / 100.0
+            if r_med > 0.6 * s_use:
+                head = max(s_use - r_med, 0.0)
+                sigma_up *= cap(head / (0.25 * s_use), 0.45, 1.0)
         qs = []
         for z in Z:
             side = sigma_up if z > 0 else (sigma_down if z < 0 else sigma)
